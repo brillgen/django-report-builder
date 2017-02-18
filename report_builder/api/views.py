@@ -1,3 +1,4 @@
+import copy
 from django.contrib.contenttypes.models import ContentType
 from django.shortcuts import get_object_or_404
 from django.utils.functional import cached_property
@@ -6,35 +7,56 @@ from rest_framework import viewsets
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser
+from ..models import Report, Format, FilterField
 from .serializers import (
     ReportNestedSerializer, ReportSerializer, FormatSerializer,
-    FilterFieldSerializer)
-from report_builder.models import Report, Format, FilterField
-from report_utils.mixins import GetFieldsMixin, DataExportMixin
-import copy
+    FilterFieldSerializer, ContentTypeSerializer)
+from ..mixins import GetFieldsMixin, DataExportMixin
 
 
-class FormatViewSet(viewsets.ModelViewSet):
-    queryset = Format.objects.all()
-    serializer_class = FormatSerializer
+def find_exact_position(fields_list, item):
+    current_position = 0
+    for i in fields_list:
+        if (i.name == item.name and
+                i.get_internal_type() == item.get_internal_type()):
+            return current_position
+        current_position += 1
+    return -1
+
+
+class ReportBuilderViewMixin:
+    """ Set up explicit settings so that project defaults
+    don't interfer with report builder's api. """
     pagination_class = None
 
 
-class FilterFieldViewSet(viewsets.ModelViewSet):
+class FormatViewSet(ReportBuilderViewMixin, viewsets.ModelViewSet):
+    queryset = Format.objects.all()
+    serializer_class = FormatSerializer
+
+
+class FilterFieldViewSet(ReportBuilderViewMixin, viewsets.ModelViewSet):
     queryset = FilterField.objects.all()
     serializer_class = FilterFieldSerializer
 
 
-class ReportViewSet(viewsets.ModelViewSet):
+class ContentTypeViewSet(ReportBuilderViewMixin, viewsets.ReadOnlyModelViewSet):
+    """ Read only view of content types.
+    Used to populate choices for new report root model.
+    """
+    queryset = ContentType.objects.all()
+    serializer_class = ContentTypeSerializer
+    permission_classes = (IsAdminUser,)
+
+
+class ReportViewSet(ReportBuilderViewMixin, viewsets.ModelViewSet):
     queryset = Report.objects.all()
     serializer_class = ReportSerializer
-    pagination_class = None
 
 
-class ReportNestedViewSet(viewsets.ModelViewSet):
+class ReportNestedViewSet(ReportBuilderViewMixin, viewsets.ModelViewSet):
     queryset = Report.objects.all()
     serializer_class = ReportNestedSerializer
-    pagination_class = None
 
     def perform_create(self, serializer):
         serializer.save(user_created=self.request.user)
@@ -43,17 +65,17 @@ class ReportNestedViewSet(viewsets.ModelViewSet):
         serializer.save(user_modified=self.request.user)
 
 
-class RelatedFieldsView(GetFieldsMixin, APIView):
+class RelatedFieldsView(ReportBuilderViewMixin, GetFieldsMixin, APIView):
 
     """ Get related fields from an ORM model
     """
     permission_classes = (IsAdminUser,)
 
     def get_data_from_request(self, request):
-        self.model = request.DATA['model']
-        self.path = request.DATA['path']
-        self.path_verbose = request.DATA.get('path_verbose', '')
-        self.field = request.DATA['field']
+        self.model = request.data['model']
+        self.path = request.data['path']
+        self.path_verbose = request.data.get('path_verbose', '')
+        self.field = request.data['field']
         self.model_class = ContentType.objects.get(pk=self.model).model_class()
 
     def post(self, request):
@@ -116,6 +138,14 @@ class FieldsView(RelatedFieldsView):
             self.field,
             self.path,
             self.path_verbose,)
+
+        # External packages might cause duplicates. This clears it up
+        new_set = []
+        for i in field_data['fields']:
+            if i not in new_set:
+                new_set.append(i)
+        field_data['fields'] = new_set
+
         result = []
         fields = None
         filters = None
@@ -132,11 +162,21 @@ class FieldsView(RelatedFieldsView):
                 fields = list(fields)
                 for field in copy.copy(field_data['fields']):
                     if field.name not in fields:
-                        field_data['fields'].remove(field)
+                        index = find_exact_position(
+                            field_data['fields'],
+                            field
+                        )
+                        if index != -1:
+                            field_data['fields'].pop(index)
             if exclude is not None:
                 for field in copy.copy(field_data['fields']):
                     if field.name in exclude:
-                        field_data['fields'].remove(field)
+                        index = find_exact_position(
+                            field_data['fields'],
+                            field
+                        )
+                        if index != -1:
+                            field_data['fields'].pop(index)
             if extra is not None:
                 extra = list(extra)
 
@@ -194,7 +234,7 @@ class FieldsView(RelatedFieldsView):
                     'field': field.name,
                     'field_verbose': field.name,
                     'field_type': 'Custom Field',
-                    'field_choices': field.choices,
+                    'field_choices': getattr(field, 'choices', None),
                     'can_filter': True if filters is None or
                     field.name in filters else False,
                     'path': field_data['path'],
@@ -206,7 +246,7 @@ class FieldsView(RelatedFieldsView):
         return Response(result)
 
 
-class GenerateReport(DataExportMixin, APIView):
+class GenerateReport(ReportBuilderViewMixin, DataExportMixin, APIView):
     permission_classes = (IsAdminUser,)
 
     def get(self, request, report_id=None):
@@ -214,22 +254,12 @@ class GenerateReport(DataExportMixin, APIView):
 
     def post(self, request, report_id=None):
         report = get_object_or_404(Report, pk=report_id)
-        user = request.user
-        queryset = report.get_query()
 
-        display_fields = report.get_good_display_fields()
-        property_filters = []
-        for field in report.filterfield_set.all():
-            if field.field_type in ["Property", "Custom Field"]:
-                property_filters += [field]
-
-        objects_list, message = self.report_to_list(
-            queryset,
-            display_fields,
-            user,
-            property_filters=property_filters,
+        objects_list = report.report_to_list(
+            user=request.user,
             preview=True,)
-        display_fields = display_fields.values_list('name', flat=True)
+        display_fields = report.get_good_display_fields().values_list(
+            'name', flat=True)
         response = {
             'data': objects_list,
             'meta': {'titles': display_fields},
